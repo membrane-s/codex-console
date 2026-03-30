@@ -14,7 +14,7 @@ from curl_cffi.requests import Session, Response
 
 from ..config.constants import ERROR_MESSAGES
 from ..config.settings import get_settings
-from .openai.sentinel import SentinelPOWError, build_sentinel_pow_token
+from .openai.sentinel import SentinelPOWError, build_sentinel_pow_token, solve_pow_challenge, solve_turnstile_challenge
 
 
 logger = logging.getLogger(__name__)
@@ -350,12 +350,18 @@ class OpenAIHTTPClient(HTTPClient):
         except cffi_requests.RequestsError as e:
             raise HTTPClientError(f"OpenAI 请求失败: {endpoint} - {e}")
 
-    def check_sentinel(self, did: str, proxies: Optional[Dict] = None) -> Optional[str]:
+    def check_sentinel(self, did: str, flow: str = "username_password_create", proxies: Optional[Dict] = None) -> Optional[str]:
         """
-        检查 Sentinel 拦截
+        检查 Sentinel 拦截（两阶段流程 + Turnstile 支持）
+        1. 请求 sentinel/req 获取 seed 和 difficulty
+        2. 求解 PoW 后再次请求获取 token
 
         Args:
             did: Device ID
+            flow: Sentinel flow 类型，可选值:
+                "username_password_create" (第一轮，提交密码前)
+                "oauth_create_account" (第二轮，提交姓名/生日前)
+                "authorize_continue" (备用)
             proxies: 代理配置
 
         Returns:
@@ -364,27 +370,80 @@ class OpenAIHTTPClient(HTTPClient):
         from ..config.constants import OPENAI_API_ENDPOINTS
 
         try:
-            pow_token = build_sentinel_pow_token(self.default_headers.get("User-Agent", ""))
-            sen_req_body = json.dumps({
-                "p": pow_token,
+            # 阶段一：获取 PoW challenge
+            challenge_body = json.dumps({
                 "id": did,
-                "flow": "authorize_continue",
+                "flow": flow,
             }, separators=(",", ":"))
 
-            response = self.post(
+            challenge_response = self.post(
                 OPENAI_API_ENDPOINTS["sentinel"],
                 headers={
                     "origin": "https://sentinel.openai.com",
-                    "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+                    "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
                     "content-type": "text/plain;charset=UTF-8",
                 },
-                data=sen_req_body,
+                data=challenge_body,
             )
 
-            if response.status_code == 200:
-                return response.json().get("token")
+            if challenge_response.status_code != 200:
+                logger.warning(f"Sentinel 阶段一失败: {challenge_response.status_code}")
+                return None
+
+            challenge_data = challenge_response.json()
+            seed = challenge_data.get("seed")
+            difficulty = challenge_data.get("difficulty")
+            turnstile_required = challenge_data.get("turnstile", {}).get("required", False)
+            turnstile_site_key = challenge_data.get("turnstile", {}).get("site_key", "")
+
+            # 处理 Turnstile（如果要求）
+            turnstile_token = None
+            if turnstile_required and turnstile_site_key:
+                logger.info(f"Turnstile 挑战要求，site_key={turnstile_site_key[:16]}...")
+                page_url = "https://auth.openai.com/"
+                turnstile_token = solve_turnstile_challenge(turnstile_site_key, page_url, self.proxy_url)
+                if not turnstile_token:
+                    logger.warning("Turnstile 求解失败，后续请求可能被拒绝")
+
+            # 处理 PoW
+            if not seed or not difficulty:
+                logger.warning("Sentinel 响应缺少 seed 或 difficulty")
+                return None
+
+            logger.debug(f"Sentinel PoW challenge: seed={seed[:16]}..., difficulty={difficulty}")
+
+            user_agent = self.default_headers.get("User-Agent", "")
+            pow_token = solve_pow_challenge(seed, difficulty, user_agent)
+
+            # 阶段二：提交 PoW 答案和 Turnstile token 获取最终 token
+            submit_body = {
+                "p": pow_token,
+                "id": did,
+                "flow": flow,
+            }
+            if turnstile_token:
+                submit_body["t"] = turnstile_token
+
+            token_response = self.post(
+                OPENAI_API_ENDPOINTS["sentinel"],
+                headers={
+                    "origin": "https://sentinel.openai.com",
+                    "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+                    "content-type": "text/plain;charset=UTF-8",
+                },
+                data=json.dumps(submit_body, separators=(",", ":")),
+            )
+
+            if token_response.status_code == 200:
+                token = token_response.json().get("token")
+                if token:
+                    logger.info(f"Sentinel token 获取成功 (flow={flow})")
+                    return token
+                else:
+                    logger.warning("Sentinel 响应中无 token 字段")
+                    return None
             else:
-                logger.warning(f"Sentinel 检查失败: {response.status_code}")
+                logger.warning(f"Sentinel 阶段二失败: {token_response.status_code}")
                 return None
 
         except SentinelPOWError as e:

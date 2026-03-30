@@ -5,11 +5,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import random
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Sequence
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_SENTINEL_DIFF = "0fffff"
@@ -96,3 +99,78 @@ def build_sentinel_pow_token(
     seed = format(random.random())
     solution = solve_sentinel_pow(seed, difficulty, config, max_iterations=max_iterations)
     return f"gAAAAAC{solution}"
+
+
+def solve_pow_challenge(seed: str, difficulty: str, user_agent: str) -> str:
+    """
+    根据服务端返回的 seed 和 difficulty 求解 PoW
+
+    Args:
+        seed: 服务端提供的随机种子
+        difficulty: 难度值（如 "0fffff"）
+        user_agent: 浏览器 User-Agent
+
+    Returns:
+        PoW token 字符串
+    """
+    config = build_sentinel_config(user_agent)
+    solution = solve_sentinel_pow(seed, difficulty, config, max_iterations=DEFAULT_MAX_ITERATIONS)
+    return f"gAAAAAC{solution}"
+
+
+# --------------- Turnstile 求解框架 ---------------
+
+import abc
+from typing import Optional as _Optional
+
+
+class TurnstileSolver(abc.ABC):
+    """Turnstile 求解器抽象基类"""
+
+    @abc.abstractmethod
+    def solve(self, site_key: str, page_url: str, proxy: _Optional[str] = None) -> _Optional[str]:
+        """
+        求解 Turnstile 挑战
+
+        Args:
+            site_key: Turnstile site key
+            page_url: 当前页面 URL
+            proxy: 代理 URL（可选）
+
+        Returns:
+            Turnstile token (cf_clearance 或类似值)
+        """
+        pass
+
+
+class DummyTurnstileSolver(TurnstileSolver):
+    """占位 Turnstile 求解器（始终返回 None，需接入真实服务）"""
+
+    def solve(self, site_key: str, page_url: str, proxy: _Optional[str] = None) -> _Optional[str]:
+        logger.warning(f"Turnstile 挑战未实现真实求解器，site_key={site_key}, page_url={page_url}")
+        return None
+
+
+# 全局求解器实例（可通过配置替换）
+_turnstile_solver: TurnstileSolver = DummyTurnstileSolver()
+
+
+def set_turnstile_solver(solver: TurnstileSolver):
+    """设置 Turnstile 求解器（用于接入 capsolver 等服务）"""
+    global _turnstile_solver
+    _turnstile_solver = solver
+
+
+def solve_turnstile_challenge(site_key: str, page_url: str, proxy: _Optional[str] = None) -> _Optional[str]:
+    """
+    求解 Turnstile 挑战
+
+    Args:
+        site_key: Turnstile site key
+        page_url: 页面 URL
+        proxy: 代理 URL
+
+    Returns:
+        Turnstile token
+    """
+    return _turnstile_solver.solve(site_key, page_url, proxy)
