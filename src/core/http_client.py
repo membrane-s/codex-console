@@ -391,6 +391,13 @@ class OpenAIHTTPClient(HTTPClient):
                 return None
 
             challenge_data = challenge_response.json()
+
+            # 兼容：某些 flow/场景下 sentinel 直接返回 token（无需两阶段）
+            direct_token = challenge_data.get("token")
+            if direct_token:
+                logger.info(f"Sentinel 直接返回 token (flow={flow})，跳过两阶段")
+                return direct_token
+
             seed = challenge_data.get("seed")
             difficulty = challenge_data.get("difficulty")
             turnstile_required = challenge_data.get("turnstile", {}).get("required", False)
@@ -407,7 +414,7 @@ class OpenAIHTTPClient(HTTPClient):
 
             # 处理 PoW
             if not seed or not difficulty:
-                logger.warning("Sentinel 响应缺少 seed 或 difficulty")
+                logger.warning(f"Sentinel 响应缺少 seed 或 difficulty，实际响应: {json.dumps(challenge_data)[:300]}")
                 return None
 
             logger.debug(f"Sentinel PoW challenge: seed={seed[:16]}..., difficulty={difficulty}")
